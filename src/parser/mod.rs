@@ -61,16 +61,27 @@ impl std::fmt::Display for ParseError {
 
 /// Parses markdown text into a [`SourceFile`].
 pub fn parse(source: &str) -> Result<SourceFile<'_>, ParseError> {
+  parse_inner(source, false)
+}
+
+/// Parses MDX text into a [`SourceFile`], recognizing import/export statements
+/// and JSX blocks in addition to standard markdown.
+pub fn parse_mdx(source: &str) -> Result<SourceFile<'_>, ParseError> {
+  parse_inner(source, true)
+}
+
+fn parse_inner(source: &str, is_mdx: bool) -> Result<SourceFile<'_>, ParseError> {
   let lines = source_lines(source);
   let (metadata, body_start) = parse_metadata_block(source, &lines);
 
-  let (link_labels, footnote_labels) = collect_labels(source, &lines[body_start..]);
+  let (link_labels, footnote_labels) = collect_labels(source, &lines[body_start..], is_mdx);
   let context = InlineContext::new(source, link_labels.clone(), footnote_labels.clone(), false);
   let parser = BlockParser {
     source,
     context: &context,
     depth: Default::default(),
     too_deep: Default::default(),
+    is_mdx,
   };
 
   let mut children: Vec<Node<'_>> = Vec::new();
@@ -153,7 +164,7 @@ fn parse_metadata_block<'a>(source: &'a str, lines: &[ContentLine<'a>]) -> (Opti
 
 /// Finds the labels the document defines, which decide whether a `[label]` is
 /// a link or a footnote reference rather than plain text.
-fn collect_labels(source: &str, lines: &[ContentLine<'_>]) -> (HashSet<String>, HashSet<String>) {
+fn collect_labels(source: &str, lines: &[ContentLine<'_>], is_mdx: bool) -> (HashSet<String>, HashSet<String>) {
   let mut link_labels = HashSet::new();
   let mut footnote_labels = HashSet::new();
   // definitions always contain a `]:`, so most documents can skip the pass
@@ -167,6 +178,7 @@ fn collect_labels(source: &str, lines: &[ContentLine<'_>]) -> (HashSet<String>, 
     context: &context,
     depth: Default::default(),
     too_deep: Default::default(),
+    is_mdx,
   };
   collect_node_labels(&parser.parse_blocks(lines), &mut link_labels, &mut footnote_labels);
   (link_labels, footnote_labels)

@@ -118,6 +118,24 @@ pub struct Html<'a> {
   pub is_block: bool,
 }
 
+/// An MDX import or export statement (ex. `import Foo from './foo'`).
+///
+/// These only appear in `.mdx` files.
+pub struct MdxImportExport<'a> {
+  pub span: Span,
+  pub text: Cow<'a, str>,
+}
+
+/// An MDX expression block (a `{...}` on its own line).
+///
+/// These only appear in `.mdx` files.
+pub struct MdxExpression<'a> {
+  pub span: Span,
+  /// The text of the expression, preserved for potential future use.
+  #[allow(dead_code)]
+  pub text: Cow<'a, str>,
+}
+
 /// A `$$` delimited math block.
 pub struct DisplayMath<'a> {
   pub span: Span,
@@ -393,6 +411,8 @@ generate_node![
   Text<'a>,
   TextDecoration<'a>,
   Html<'a>,
+  MdxImportExport<'a>,
+  MdxExpression<'a>,
   DisplayMath<'a>,
   InlineMath<'a>,
   FootnoteReference<'a>,

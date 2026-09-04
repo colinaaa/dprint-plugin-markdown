@@ -17,10 +17,13 @@ mod html;
 mod parser;
 
 pub use format_text::format_text;
+pub use format_text::format_mdx_text;
 pub use format_text::FormatError;
 
 #[cfg(feature = "tracing")]
 pub use format_text::trace_file;
+#[cfg(feature = "tracing")]
+pub use format_text::trace_mdx_file;
 
 #[cfg(feature = "wasm")]
 #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]

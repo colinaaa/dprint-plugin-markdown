@@ -693,6 +693,9 @@ impl<'a> Context<'a> {
       "markdown" | "md" => format_text(text, self.configuration, |tag, file_text, line_width| {
         (self.format_code_block_text)(tag, file_text, line_width)
       }),
+      "mdx" => crate::format_text::format_mdx_text(text, self.configuration, |tag, file_text, line_width| {
+        (self.format_code_block_text)(tag, file_text, line_width)
+      }),
       _ => (self.format_code_block_text)(tag, text, line_width),
     }
   }

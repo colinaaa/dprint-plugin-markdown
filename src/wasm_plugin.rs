@@ -43,6 +43,7 @@ impl SyncPluginHandler<Configuration> for MarkdownPluginHandler {
           "mkdn".to_string(),
           "mdown".to_string(),
           "markdown".to_string(),
+          "mdx".to_string(),
         ],
         file_names: vec![],
       },
@@ -92,7 +93,11 @@ impl SyncPluginHandler<Configuration> for MarkdownPluginHandler {
   ) -> FormatResult {
     let file_text = String::from_utf8(request.file_bytes)?;
     let config = request.config.clone();
-    return super::format_text(&file_text, request.config, |tag, file_text, line_width| {
+    let is_mdx = request
+      .file_path
+      .extension()
+      .is_some_and(|ext| ext.eq_ignore_ascii_case("mdx"));
+    let format_code_block = |tag: &str, file_text: &str, line_width: u32| -> Result<Option<String>, super::FormatError> {
       if let Some(ext) = tag_to_extension(tag, &config) {
         let file_path = PathBuf::from(format!("file.{}", ext));
         let mut additional_config = ConfigKeyMap::new();
@@ -118,9 +123,15 @@ impl SyncPluginHandler<Configuration> for MarkdownPluginHandler {
       } else {
         Ok(None)
       }
-    })
-    .map(|maybe_text| maybe_text.map(|t| t.into_bytes()))
-    .map_err(CoreFormatError::new);
+    };
+    let result = if is_mdx {
+      super::format_mdx_text(&file_text, request.config, format_code_block)
+    } else {
+      super::format_text(&file_text, request.config, format_code_block)
+    };
+    return result
+      .map(|maybe_text| maybe_text.map(|t| t.into_bytes()))
+      .map_err(CoreFormatError::new);
 
     fn tag_to_extension<'a>(tag: &str, config: &'a Configuration) -> Option<&'a str> {
       let tag_lower = tag.trim().to_lowercase();
