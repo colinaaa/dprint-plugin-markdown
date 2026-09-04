@@ -616,3 +616,170 @@ fn prettier_jsx_codeblock() {
   assert!(result.contains("<div>foo</div>"), "code block content lost: {:?}", result);
   assert_idempotent(input);
 }
+
+// =========================================================================
+// ESM formatting via the tsx callback
+// =========================================================================
+
+#[test]
+fn esm_import_formatted_by_callback() {
+  // Simulate a TS formatter that normalises quotes and adds semicolons.
+  let input = "import {   Foo} from './bar'\n\n# Title\n";
+  let result = format_mdx_text(input, &config(), |tag, text, _width| {
+    if tag == "tsx" {
+      Ok(Some(text.replace("'", "\"") + ";\n"))
+    } else {
+      Ok(None)
+    }
+  })
+  .unwrap()
+  .unwrap();
+  // The callback was invoked and its result used.
+  assert!(result.contains(";\n"), "callback result not used: {:?}", result);
+  assert!(result.contains("# Title"), "heading lost: {:?}", result);
+}
+
+#[test]
+fn esm_export_formatted_by_callback() {
+  let input = "export const x={a:1,b:2}\n\n# Title\n";
+  let result = format_mdx_text(input, &config(), |tag, text, _width| {
+    if tag == "tsx" && text.contains("export") {
+      Ok(Some("export const x = { a: 1, b: 2 };\n".to_string()))
+    } else {
+      Ok(None)
+    }
+  })
+  .unwrap()
+  .unwrap();
+  assert!(
+    result.contains("export const x = { a: 1, b: 2 };"),
+    "export not formatted: {:?}",
+    result
+  );
+}
+
+#[test]
+fn flow_jsx_formatted_by_callback() {
+  let input = "<Comp   a='b'   />\n\n# Title\n";
+  let result = format_mdx_text(input, &config(), |tag, text, _width| {
+    if tag == "tsx" && text.contains("<Comp") {
+      Ok(Some("<Comp a=\"b\" />\n".to_string()))
+    } else {
+      Ok(None)
+    }
+  })
+  .unwrap()
+  .unwrap();
+  assert!(
+    result.contains("<Comp a=\"b\" />"),
+    "JSX not formatted: {:?}",
+    result
+  );
+}
+
+#[test]
+fn flow_expression_formatted_by_callback() {
+  let input = "{/*  a comment  */}\n\n# Title\n";
+  let result = format_mdx_text(input, &config(), |tag, text, _width| {
+    if tag == "tsx" && text.contains("comment") {
+      Ok(Some("{/* a comment */}\n".to_string()))
+    } else {
+      Ok(None)
+    }
+  })
+  .unwrap()
+  .unwrap();
+  assert!(
+    result.contains("{/* a comment */}"),
+    "expression not formatted: {:?}",
+    result
+  );
+}
+
+#[test]
+fn callback_error_falls_back_to_original() {
+  let input = "import Foo from 'bar'\n\n# Title\n";
+  let result = format_mdx_text(input, &config(), |tag, _text, _width| {
+    if tag == "tsx" {
+      Err(FormatError::CodeBlock("mock error".into()))
+    } else {
+      Ok(None)
+    }
+  })
+  .unwrap()
+  .unwrap_or_else(|| input.to_string());
+  // The import should be preserved as-is when the callback errors.
+  assert!(result.contains("import Foo from 'bar'"), "import lost: {:?}", result);
+  assert!(result.contains("# Title"), "heading lost: {:?}", result);
+}
+
+// =========================================================================
+// v4-P1: Brace counting with comments
+// =========================================================================
+
+#[test]
+fn esm_with_block_comment_brace() {
+  // /* } */ inside an export must not end it early.
+  let input = "export function f() {\n  /* } */\n\n  return \"a  b\"\n}\n\n# Title\n";
+  let result = mdx(input);
+  assert!(
+    result.contains("return \"a  b\""),
+    "ESM with block comment brace was split: {:?}",
+    result
+  );
+}
+
+#[test]
+fn esm_with_line_comment_brace() {
+  // // } inside an export must not end it early.
+  let input = "export function f() {\n  // }\n\n  return \"a  b\"\n}\n\n# Title\n";
+  let result = mdx(input);
+  assert!(
+    result.contains("return \"a  b\""),
+    "ESM with line comment brace was split: {:?}",
+    result
+  );
+}
+
+// =========================================================================
+// v4-P1: Ignore placeholder uniqueness
+// =========================================================================
+
+#[test]
+fn ignore_placeholder_not_replacing_code_span() {
+  let input = "`<!-- dprint-ignore -->`\n\n{/* dprint-ignore */}\n\n#  Title\n";
+  let result = mdx(input);
+  // The code span must keep its original content, not be replaced.
+  assert!(
+    result.contains("`<!-- dprint-ignore -->`"),
+    "code span was corrupted: {:?}",
+    result
+  );
+  // The ignore should still work on the heading.
+  assert!(result.contains("#  Title"), "ignore didn't work: {:?}", result);
+}
+
+// =========================================================================
+// v4-P1: CRLF line ending normalisation
+// =========================================================================
+
+#[test]
+fn crlf_normalised_in_mdx_regions() {
+  let input = "import Foo from './foo'\r\n\r\n#  Hello\r\n";
+  let result = mdx(input);
+  // With default LF config, CRLF should become LF everywhere.
+  assert!(!result.contains("\r\n"), "CRLF not normalised: {:?}", result);
+}
+
+// =========================================================================
+// v4-P2: Frontmatter with `...` closer
+// =========================================================================
+
+#[test]
+fn frontmatter_yaml_dots_closer() {
+  let input = "---\ntitle: test\n...\n\n#  Hello\n";
+  let result = format_mdx_text(input, &config(), |_, _, _| Ok(None));
+  assert!(result.is_ok());
+  let text = result.unwrap().unwrap_or_else(|| input.to_string());
+  assert!(text.contains("# Hello"), "heading not formatted: {:?}", text);
+}

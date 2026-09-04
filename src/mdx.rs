@@ -1,70 +1,105 @@
 //! MDX support via pre/post-processing.
 //!
-//! MDX files are markdown with embedded JSX, import/export statements, and
-//! `{expression}` blocks. Rather than teaching the markdown parser about all
-//! of these, we use `markdown-rs` (with `ParseOptions::mdx()`) to locate the
-//! byte spans of every MDX-specific node, replace each one with a placeholder
-//! that the markdown formatter will leave alone, format the resulting markdown,
-//! and then put the original MDX text back in place of each placeholder.
+//! Uses `markdown-rs` (the reference MDX parser) to locate every MDX-specific
+//! node, protects each one with a placeholder while the markdown formatter
+//! runs, then restores the (optionally formatted) originals.
 //!
-//! This approach is safe because `markdown-rs` is the reference Rust MDX
-//! parser by the same author as the MDX specification.
+//! Block-level ESM (`import`/`export`) and flow expressions / JSX are offered
+//! to the host's TypeScript formatter via the code-block callback (tag `tsx`).
+//! If the host has `@dprint/typescript` installed it will format them;
+//! otherwise the original text is kept.
+
+use dprint_core::configuration::resolve_new_line_kind;
 
 use crate::configuration::Configuration;
 use crate::format_text::FormatError;
 
-/// A region of the source that holds MDX-specific syntax, together with the
-/// text to substitute for it while the markdown formatter runs.
-struct MdxRegion {
-  start: usize,
-  end: usize,
-  /// What the formatter sees in place of the original text.
-  placeholder: String,
-  /// The original text, restored after formatting.
-  original: String,
-}
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 /// Formats an MDX file.
-///
-/// MDX-specific constructs (imports, exports, JSX components, expressions)
-/// are protected from the markdown formatter and restored afterward.
-/// The `format_code_block_text` callback is forwarded to the inner markdown
-/// formatter for fenced code blocks.
 pub fn format_mdx_text(
   file_text: &str,
   config: &Configuration,
-  format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
+  mut format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
 ) -> Result<Option<String>, FormatError> {
-  // 1. Parse with markdown-rs to find MDX spans.
-  let tree = match parse_mdx_tree(file_text) {
+  let new_line = resolve_new_line_kind(file_text, config.new_line_kind);
+
+  // 1. Strip frontmatter: the repository's parser accepts `...` as YAML
+  //    closer but markdown-rs does not. Strip it so markdown-rs only sees
+  //    the body.
+  let (frontmatter, body) = split_frontmatter(file_text);
+
+  // 2. Parse the body with markdown-rs in MDX mode.
+  let tree = match parse_mdx_tree(body) {
     Some(tree) => tree,
-    // If markdown-rs can't parse it (invalid MDX), return the file unchanged
-    // rather than risking corruption.
-    None => return Ok(None),
+    None => return Ok(None), // unparseable MDX → return unchanged
   };
 
+  // 3. Collect MDX spans (byte offsets into `body`).
   let mut spans = Vec::new();
   collect_mdx_spans(&tree, &mut spans);
   spans.sort_by_key(|s| s.start);
   let spans = merge_spans(spans);
 
-  // No MDX nodes at all — format as plain markdown.
   if spans.is_empty() {
     return crate::format_text(file_text, config, format_code_block_text);
   }
 
-  // 2. Build regions with unique placeholders.
+  // 4. For each span, try to format via the tsx callback, build a unique
+  //    placeholder that preserves the original newline count.
   let nonce = find_nonce(file_text);
-  let regions = build_regions(file_text, &spans, &nonce, config);
+  let line_width = config.line_width;
+  let regions: Vec<MdxRegion> = spans
+    .iter()
+    .enumerate()
+    .map(|(i, span)| {
+      let original = &body[span.start..span.end];
 
-  // 3. Build the placeholder'd text.
-  let placeholdered = build_placeholdered_text(file_text, &regions);
+      // Try formatting block-level MDX via the host's TypeScript formatter.
+      let restored = if span.formattable {
+        try_format_region(original, line_width, &mut format_code_block_text)
+      } else {
+        original.to_string()
+      };
+      let restored = normalize_newlines(&restored, new_line);
 
-  // 4. Format the placeholder'd text as markdown.
+      // Placeholder: HTML comment. Padding newlines are appended to the
+      // placeholdered text (not part of the placeholder itself) so the
+      // formatter can normalize them without breaking restoration.
+      let newlines = original.chars().filter(|c| *c == '\n').count();
+      let placeholder = if let Some(directive) = as_ignore_directive(original, config) {
+        format!("<!-- {} -->", directive)
+      } else {
+        format!("<!-- {} {} -->", nonce, i)
+      };
+
+      MdxRegion { placeholder, restored, newline_padding: newlines }
+    })
+    .collect();
+
+  // 5. Assemble placeholdered text.
+  let mut placeholdered = String::with_capacity(file_text.len());
+  if let Some(fm) = frontmatter {
+    placeholdered.push_str(fm);
+  }
+  let mut pos = 0;
+  for (span, region) in spans.iter().zip(regions.iter()) {
+    placeholdered.push_str(&body[pos..span.start]);
+    placeholdered.push_str(&region.placeholder);
+    for _ in 0..region.newline_padding {
+      placeholdered.push('\n');
+    }
+    pos = span.end;
+  }
+  placeholdered.push_str(&body[pos..]);
+
+  // 6. Format the placeholdered text as plain markdown.
   let formatted = crate::format_text(&placeholdered, config, format_code_block_text)?;
   let formatted_text = formatted.as_deref().unwrap_or(&placeholdered);
 
-  // 5. Restore originals in a single pass.
+  // 7. Restore regions in a single forward scan.
   let result = restore_regions(formatted_text, &regions);
 
   if result == file_text {
@@ -75,89 +110,181 @@ pub fn format_mdx_text(
 }
 
 // ---------------------------------------------------------------------------
-// Parsing
+// Types
 // ---------------------------------------------------------------------------
 
-/// Parses MDX source into an mdast tree.
+struct MdxSpan {
+  start: usize,
+  end: usize,
+  /// Whether this region can be sent to the TypeScript formatter.
+  formattable: bool,
+}
+
+struct MdxRegion {
+  placeholder: String,
+  /// What to put back: either formatted output or the original.
+  restored: String,
+  /// Number of newlines to add after the placeholder in the placeholdered text
+  /// (to preserve line count for diagnostics).
+  newline_padding: usize,
+}
+
+// ---------------------------------------------------------------------------
+// Frontmatter
+// ---------------------------------------------------------------------------
+
+fn split_frontmatter(text: &str) -> (Option<&str>, &str) {
+  let first_line = text.lines().next().unwrap_or("");
+  let close_markers: &[&str] = match first_line.trim_end() {
+    "---" => &["---", "..."],
+    "+++" => &["+++"],
+    _ => return (None, text),
+  };
+  // Advance past the first line (including its newline).
+  let mut offset = first_line.len();
+  offset += line_ending_len(text, offset);
+  if offset >= text.len() {
+    return (None, text);
+  }
+  // Second line must exist, be non-blank, and not be a closer.
+  let second_line = text[offset..].lines().next().unwrap_or("");
+  if second_line.trim().is_empty() || close_markers.contains(&second_line.trim_end()) {
+    return (None, text);
+  }
+  // Advance past the second line.
+  offset += second_line.len();
+  offset += line_ending_len(text, offset);
+  // Scan remaining lines for the closing marker.
+  while offset < text.len() {
+    let line = text[offset..].lines().next().unwrap_or("");
+    offset += line.len();
+    offset += line_ending_len(text, offset);
+    if close_markers.contains(&line.trim_end()) {
+      return (Some(&text[..offset]), &text[offset..]);
+    }
+  }
+  (None, text) // unclosed
+}
+
+/// Length of the line ending at `offset` (0, 1, or 2).
+fn line_ending_len(text: &str, offset: usize) -> usize {
+  if text[offset..].starts_with("\r\n") {
+    2
+  } else if text[offset..].starts_with('\n') {
+    1
+  } else {
+    0
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MDX parsing
+// ---------------------------------------------------------------------------
+
 fn parse_mdx_tree(source: &str) -> Option<markdown::mdast::Node> {
   let opts = markdown::ParseOptions {
     constructs: markdown::Constructs {
-      // P1-1: Enable frontmatter so that YAML/TOML metadata blocks don't
-      // confuse the MDX parser (e.g., `<Component>` inside `---` fences
-      // would otherwise panic).
       frontmatter: true,
       ..markdown::Constructs::mdx()
     },
-    // P1-2: Use Eof for incomplete expressions/ESM so that multi-line
-    // constructs with blank lines aren't prematurely terminated.
     mdx_esm_parse: Some(Box::new(esm_parse)),
     mdx_expression_parse: Some(Box::new(expression_parse)),
     ..markdown::ParseOptions::mdx()
   };
-  // Catch any remaining panics (markdown-rs is complex) rather than
-  // aborting the process.
   std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| markdown::to_mdast(source, &opts)))
     .ok()?
     .ok()
 }
 
-/// ESM parse callback: returns `Ok` when braces are balanced, `Eof` when the
-/// input looks incomplete (more `{` than `}`).
-///
-/// This is not a real JS parser, but it's enough to prevent markdown-rs from
-/// splitting a multi-line `export function` at the first blank line. A real
-/// JS parser (e.g., SWC) would be needed for full correctness with regex
-/// literals like `/}/`.
 fn esm_parse(value: &str) -> markdown::MdxSignal {
-  if braces_balanced(value) {
+  if js_braces_balanced(value) {
     markdown::MdxSignal::Ok
   } else {
-    markdown::MdxSignal::Eof(
-      "Incomplete ESM".into(),
-      Box::new("esm".into()),
-      Box::new("esm".into()),
-    )
+    markdown::MdxSignal::Eof("Incomplete ESM".into(), Box::default(), Box::default())
   }
 }
 
-/// Expression parse callback: same brace-balancing logic.
 fn expression_parse(value: &str, _kind: &markdown::MdxExpressionKind) -> markdown::MdxSignal {
-  if braces_balanced(value) {
+  if js_braces_balanced(value) {
     markdown::MdxSignal::Ok
   } else {
     markdown::MdxSignal::Eof(
       "Incomplete expression".into(),
-      Box::new("expression".into()),
-      Box::new("expression".into()),
+      Box::default(),
+      Box::default(),
     )
   }
 }
 
-/// Whether the braces in the value are balanced, respecting string literals
-/// and template literals (but not regex — that would require a full parser).
-fn braces_balanced(value: &str) -> bool {
+/// Checks brace balance, skipping contents of strings, template literals,
+/// single-line comments (`//`), and block comments (`/* */`).
+fn js_braces_balanced(value: &str) -> bool {
+  let b = value.as_bytes();
+  let len = b.len();
   let mut depth: i32 = 0;
-  let mut in_single = false;
-  let mut in_double = false;
-  let mut in_template = false;
-  let mut escaped = false;
-
-  for ch in value.chars() {
-    if escaped {
-      escaped = false;
-      continue;
-    }
-    if ch == '\\' && (in_single || in_double || in_template) {
-      escaped = true;
-      continue;
-    }
-    match ch {
-      '\'' if !in_double && !in_template => in_single = !in_single,
-      '"' if !in_single && !in_template => in_double = !in_double,
-      '`' if !in_single && !in_double => in_template = !in_template,
-      '{' if !in_single && !in_double && !in_template => depth += 1,
-      '}' if !in_single && !in_double && !in_template => depth -= 1,
-      _ => {}
+  let mut i = 0;
+  while i < len {
+    match b[i] {
+      b'\'' | b'"' => {
+        let q = b[i];
+        i += 1;
+        while i < len && b[i] != q {
+          if b[i] == b'\\' {
+            i += 1;
+          }
+          i += 1;
+        }
+        i += 1;
+      }
+      b'`' => {
+        i += 1;
+        while i < len && b[i] != b'`' {
+          if b[i] == b'\\' {
+            i += 1;
+          } else if b[i] == b'$' && i + 1 < len && b[i + 1] == b'{' {
+            i += 2;
+            let mut nest = 1i32;
+            while i < len && nest > 0 {
+              match b[i] {
+                b'{' => nest += 1,
+                b'}' => nest -= 1,
+                b'\\' => {
+                  i += 1;
+                }
+                _ => {}
+              }
+              i += 1;
+            }
+            continue;
+          }
+          i += 1;
+        }
+        i += 1;
+      }
+      b'/' if i + 1 < len && b[i + 1] == b'/' => {
+        i += 2;
+        while i < len && b[i] != b'\n' {
+          i += 1;
+        }
+      }
+      b'/' if i + 1 < len && b[i + 1] == b'*' => {
+        i += 2;
+        while i + 1 < len && !(b[i] == b'*' && b[i + 1] == b'/') {
+          i += 1;
+        }
+        i += 2;
+      }
+      b'{' => {
+        depth += 1;
+        i += 1;
+      }
+      b'}' => {
+        depth -= 1;
+        i += 1;
+      }
+      _ => {
+        i += 1;
+      }
     }
   }
   depth <= 0
@@ -167,10 +294,8 @@ fn braces_balanced(value: &str) -> bool {
 // Span collection
 // ---------------------------------------------------------------------------
 
-/// Collects the byte spans of all MDX-specific nodes that need protection.
 fn collect_mdx_spans(node: &markdown::mdast::Node, spans: &mut Vec<MdxSpan>) {
   match node {
-    // Block-level MDX: ESM, flow expressions, flow JSX elements.
     markdown::mdast::Node::MdxjsEsm(_)
     | markdown::mdast::Node::MdxFlowExpression(_)
     | markdown::mdast::Node::MdxJsxFlowElement(_) => {
@@ -178,22 +303,22 @@ fn collect_mdx_spans(node: &markdown::mdast::Node, spans: &mut Vec<MdxSpan>) {
         spans.push(MdxSpan {
           start: pos.start.offset,
           end: pos.end.offset,
+          formattable: true,
         });
       }
-      return; // Don't recurse; the whole subtree is MDX.
+      return;
     }
 
-    // P1-5: Any phrasing container that holds inline MDX must be protected
-    // as a whole unit. This covers Paragraph, Heading, and (with GFM)
-    // TableCell — all containers whose text content the markdown formatter
-    // would otherwise reflow or normalise.
-    markdown::mdast::Node::Paragraph(_) | markdown::mdast::Node::Heading(_) | markdown::mdast::Node::TableCell(_)
+    markdown::mdast::Node::Paragraph(_)
+    | markdown::mdast::Node::Heading(_)
+    | markdown::mdast::Node::TableCell(_)
       if has_inline_mdx_deep(node) =>
     {
       if let Some(pos) = node.position() {
         spans.push(MdxSpan {
           start: pos.start.offset,
           end: pos.end.offset,
+          formattable: false,
         });
       }
       return;
@@ -201,8 +326,6 @@ fn collect_mdx_spans(node: &markdown::mdast::Node, spans: &mut Vec<MdxSpan>) {
 
     _ => {}
   }
-
-  // Recurse for containers (root, blockquote, list items, etc.)
   if let Some(children) = node.children() {
     for child in children {
       collect_mdx_spans(child, spans);
@@ -210,32 +333,22 @@ fn collect_mdx_spans(node: &markdown::mdast::Node, spans: &mut Vec<MdxSpan>) {
   }
 }
 
-struct MdxSpan {
-  start: usize,
-  end: usize,
-}
-
-/// Whether a node or any of its descendants is an inline MDX node.
 fn has_inline_mdx_deep(node: &markdown::mdast::Node) -> bool {
-  if matches!(
+  matches!(
     node,
     markdown::mdast::Node::MdxTextExpression(_) | markdown::mdast::Node::MdxJsxTextElement(_)
-  ) {
-    return true;
-  }
-  node
+  ) || node
     .children()
-    .map(|children| children.iter().any(has_inline_mdx_deep))
-    .unwrap_or(false)
+    .is_some_and(|c| c.iter().any(has_inline_mdx_deep))
 }
 
-/// Merges overlapping or adjacent spans.
 fn merge_spans(spans: Vec<MdxSpan>) -> Vec<MdxSpan> {
   let mut merged: Vec<MdxSpan> = Vec::new();
   for span in spans {
     if let Some(last) = merged.last_mut() {
       if span.start <= last.end {
         last.end = last.end.max(span.end);
+        last.formattable = last.formattable && span.formattable;
         continue;
       }
     }
@@ -245,102 +358,98 @@ fn merge_spans(spans: Vec<MdxSpan>) -> Vec<MdxSpan> {
 }
 
 // ---------------------------------------------------------------------------
-// Placeholder management
+// Formatting helpers
 // ---------------------------------------------------------------------------
 
-/// P1-4: Finds a nonce string that does not appear anywhere in the source,
-/// so placeholders built from it can never collide with user content.
-fn find_nonce(source: &str) -> String {
-  let mut nonce = String::from("__dprint_mdx_a");
-  while source.contains(&nonce) {
-    nonce.push('a');
+fn try_format_region(
+  text: &str,
+  line_width: u32,
+  cb: &mut impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
+) -> String {
+  match cb("tsx", text, line_width) {
+    Ok(Some(f)) => {
+      let f = f.strip_suffix('\n').unwrap_or(&f);
+      f.strip_suffix('\r').unwrap_or(f).to_string()
+    }
+    _ => text.to_string(),
   }
-  nonce
 }
 
-/// Builds the list of regions, each with its unique placeholder and the
-/// original text to restore.
-///
-/// P1-3: Ignore directives (`{/* dprint-ignore */}` etc.) are translated
-/// to HTML comments for the formatter, but the *original* MDX form is what
-/// gets restored — so the output never contains invalid HTML comments.
-fn build_regions(source: &str, spans: &[MdxSpan], nonce: &str, config: &Configuration) -> Vec<MdxRegion> {
-  spans
-    .iter()
-    .enumerate()
-    .map(|(i, span)| {
-      let original = source[span.start..span.end].to_string();
-      let placeholder = if let Some(html) = as_ignore_html_comment(&original, config) {
-        html
-      } else {
-        format!("<!-- {} {} -->", nonce, i)
-      };
-      MdxRegion {
-        start: span.start,
-        end: span.end,
-        placeholder,
-        original,
-      }
-    })
-    .collect()
-}
-
-/// Builds the text with all MDX regions replaced by their placeholders.
-fn build_placeholdered_text(source: &str, regions: &[MdxRegion]) -> String {
-  let mut result = String::with_capacity(source.len());
-  let mut pos = 0;
-  for region in regions {
-    result.push_str(&source[pos..region.start]);
-    result.push_str(&region.placeholder);
-    pos = region.end;
-  }
-  result.push_str(&source[pos..]);
-  result
-}
-
-/// If the MDX text is a `{/* <directive> */}` expression, returns the
-/// equivalent `<!-- <directive> -->` HTML comment.
-fn as_ignore_html_comment(text: &str, config: &Configuration) -> Option<String> {
+fn as_ignore_directive<'a>(text: &'a str, config: &Configuration) -> Option<&'a str> {
   let inner = text.strip_prefix('{')?.strip_suffix('}')?;
-  let inner = inner.trim();
-  let comment = inner.strip_prefix("/*")?.strip_suffix("*/")?;
-  let directive = comment.trim();
-
+  let comment = inner.trim().strip_prefix("/*")?.strip_suffix("*/")?;
+  let d = comment.trim();
   let directives = [
-    &config.ignore_directive,
-    &config.ignore_start_directive,
-    &config.ignore_end_directive,
-    &config.ignore_file_directive,
+    config.ignore_directive.as_str(),
+    config.ignore_start_directive.as_str(),
+    config.ignore_end_directive.as_str(),
+    config.ignore_file_directive.as_str(),
   ];
-  if directives.iter().any(|d| d.as_str() == directive) {
-    Some(format!("<!-- {} -->", directive))
+  directives.contains(&d).then_some(d)
+}
+
+fn find_nonce(source: &str) -> String {
+  let mut n = String::from("__dprint_mdx_a");
+  while source.contains(&n) {
+    n.push('a');
+  }
+  n
+}
+
+fn normalize_newlines(text: &str, new_line: &str) -> String {
+  if new_line == "\n" {
+    text.replace("\r\n", "\n")
   } else {
-    None
+    text.replace("\r\n", "\n").replace('\n', new_line)
   }
 }
 
-/// P1-4: Restores all placeholders in a single scan, avoiding repeated
-/// global replacements that could cascade or collide.
+// ---------------------------------------------------------------------------
+// Restoration
+// ---------------------------------------------------------------------------
+
+/// Restores placeholders in a single forward scan. Regions are consumed in
+/// order, so even if two placeholders have the same text (e.g. two ignore
+/// directives), each match restores the correct region.
+///
+/// Placeholders are only matched at the start of a line to avoid false
+/// positives inside code spans or other inline content.
 fn restore_regions(text: &str, regions: &[MdxRegion]) -> String {
   let mut result = String::with_capacity(text.len());
-  let mut search_from = 0;
+  let mut pos = 0;
+  let mut next_region = 0;
+  let bytes = text.as_bytes();
 
-  // For each position in the formatted text, check if any placeholder starts
-  // here. Because placeholders are unique (nonce-based) and non-overlapping,
-  // a simple linear scan works.
-  'outer: while search_from < text.len() {
-    for region in regions {
-      if text[search_from..].starts_with(&region.placeholder) {
-        result.push_str(&region.original);
-        search_from += region.placeholder.len();
-        continue 'outer;
+  while pos < text.len() {
+    let at_line_start = pos == 0 || bytes[pos - 1] == b'\n';
+
+    if at_line_start {
+      // Try the next unconsumed region first.
+      if next_region < regions.len() && text[pos..].starts_with(&regions[next_region].placeholder) {
+        result.push_str(&regions[next_region].restored);
+        pos += regions[next_region].placeholder.len();
+        next_region += 1;
+        continue;
+      }
+      // Check remaining regions (in case of reordering).
+      let mut matched = false;
+      let start = (next_region + 1).min(regions.len());
+      for region in &regions[start..] {
+        if text[pos..].starts_with(&region.placeholder) {
+          result.push_str(&region.restored);
+          pos += region.placeholder.len();
+          matched = true;
+          break;
+        }
+      }
+      if matched {
+        continue;
       }
     }
-    // Copy one character (respecting UTF-8 boundaries).
-    let ch = text[search_from..].chars().next().unwrap();
-    result.push(ch);
-    search_from += ch.len_utf8();
-  }
 
+    let ch = text[pos..].chars().next().unwrap();
+    result.push(ch);
+    pos += ch.len_utf8();
+  }
   result
 }
