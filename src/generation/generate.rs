@@ -24,8 +24,6 @@ pub fn generate(node: &Node, context: &mut Context) -> PrintItems {
     Node::Text(node) => gen_text(node, context),
     Node::TextDecoration(node) => gen_text_decoration(node, context),
     Node::Html(node) => gen_html(node, context),
-    Node::MdxImportExport(node) => gen_mdx_import_export(node, context),
-    Node::MdxExpression(node) => gen_mdx_expression(node, context),
     Node::DisplayMath(node) => gen_display_math(node, context),
     Node::InlineMath(node) => gen_inline_math(node, context),
     Node::FootnoteReference(node) => gen_footnote_reference(node, context),
@@ -396,16 +394,8 @@ fn gen_nodes_within_breaks(nodes: &[Node], context: &mut Context) -> PrintItems 
           | Node::DefinitionList(_)
           | Node::Table(_)
           | Node::BlockQuote(_)
-          | Node::MdxImportExport(_)
-          | Node::MdxExpression(_)
       ) {
-        // consecutive MDX import/export statements are kept on their own
-        // lines, separated only by whatever was between them in the file
-        if matches!(last_node, Node::MdxImportExport(_)) && matches!(node, Node::MdxImportExport(_)) {
-          let new_line_count = context.get_new_lines_in_range(last_node.span().end, node.span().start);
-          let blank_lines = std::cmp::min(new_line_count.saturating_sub(1), context.configuration.max_blank_lines);
-          items.extend(get_blank_lines(blank_lines));
-        } else if matches!(last_node, Node::LinkReference(_)) && continues_definition(node) {
+        if matches!(last_node, Node::LinkReference(_)) && continues_definition(node) {
           // the paragraph's first line only reads as text because it follows
           // the definition with nothing between: what it holds would start a
           // block where one begins, but can't interrupt one. Text is written
@@ -436,9 +426,7 @@ fn gen_nodes_within_breaks(nodes: &[Node], context: &mut Context) -> PrintItems 
           | Node::DefinitionList(_)
           | Node::Table(_)
           | Node::MetadataBlock(_)
-          | Node::BlockQuote(_)
-          | Node::MdxImportExport(_)
-          | Node::MdxExpression(_) => {
+          | Node::BlockQuote(_) => {
             items.extend(get_conditional_blank_line(node, context));
           }
           // display math is a block of its own only where it is written as one
@@ -2074,30 +2062,6 @@ fn gen_html(node: &Html, ctx: &mut Context) -> PrintItems {
       }
     }
   }
-  gen_range(node.span, ctx)
-}
-
-/// Generates an MDX import/export statement.
-///
-/// The statement is formatted by the TypeScript plugin when available
-/// (delegated via the code block callback), and preserved as-is otherwise.
-fn gen_mdx_import_export(node: &MdxImportExport, ctx: &mut Context) -> PrintItems {
-  if !ctx.configuration.code_block_skip_format {
-    match ctx.format_text("tsx", &node.text) {
-      Ok(Some(text)) => {
-        let text = text.strip_suffix('\n').unwrap_or(&text);
-        let text = text.strip_suffix('\r').unwrap_or(text);
-        return ir_helpers::gen_from_raw_string(text);
-      }
-      Ok(None) => {}
-      Err(_) => {}
-    }
-  }
-  gen_range(node.span, ctx)
-}
-
-/// Generates an MDX expression block, preserving it as-is.
-fn gen_mdx_expression(node: &MdxExpression, ctx: &mut Context) -> PrintItems {
   gen_range(node.span, ctx)
 }
 

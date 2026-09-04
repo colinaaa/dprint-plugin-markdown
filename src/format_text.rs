@@ -48,30 +48,7 @@ pub fn format_text(
   config: &Configuration,
   format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
 ) -> Result<Option<String>, FormatError> {
-  format_text_impl(file_text, config, format_code_block_text, false)
-}
-
-/// Formats an MDX file.
-///
-/// This is the same as [`format_text`] but also recognizes MDX-specific
-/// constructs: import/export statements, JSX components, and expression blocks.
-///
-/// Returns the formatted text, or `None` when it's the same as what was given.
-pub fn format_mdx_text(
-  file_text: &str,
-  config: &Configuration,
-  format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
-) -> Result<Option<String>, FormatError> {
-  format_text_impl(file_text, config, format_code_block_text, true)
-}
-
-fn format_text_impl(
-  file_text: &str,
-  config: &Configuration,
-  format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
-  is_mdx: bool,
-) -> Result<Option<String>, FormatError> {
-  let result = format_text_inner(file_text, config, format_code_block_text, is_mdx)?;
+  let result = format_text_inner(file_text, config, format_code_block_text)?;
 
   match result {
     Some(result) if result == file_text => Ok(None),
@@ -84,14 +61,13 @@ fn format_text_inner(
   file_text: &str,
   config: &Configuration,
   format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
-  is_mdx: bool,
 ) -> Result<Option<String>, FormatError> {
   let full_text = file_text;
   let file_text = strip_bom(file_text);
   // the lines taken off the front of the file, which the lines the rest of it
   // is reported on are still counted from
   let stripped_lines = count_new_lines(&full_text[..full_text.len() - file_text.len()]);
-  let (mut source_file, markdown_text) = match parse_source_file(file_text, config, is_mdx)? {
+  let (mut source_file, markdown_text) = match parse_source_file(file_text, config)? {
     ParseFileResult::IgnoreFile => return Ok(None),
     ParseFileResult::SourceFile(file) => file,
   };
@@ -130,26 +106,7 @@ pub fn trace_file(
   config: &Configuration,
   format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
 ) -> dprint_core::formatting::TracingResult {
-  trace_file_impl(file_text, config, format_code_block_text, false)
-}
-
-#[cfg(feature = "tracing")]
-pub fn trace_mdx_file(
-  file_text: &str,
-  config: &Configuration,
-  format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
-) -> dprint_core::formatting::TracingResult {
-  trace_file_impl(file_text, config, format_code_block_text, true)
-}
-
-#[cfg(feature = "tracing")]
-fn trace_file_impl(
-  file_text: &str,
-  config: &Configuration,
-  format_code_block_text: impl for<'a> FnMut(&str, &'a str, u32) -> Result<Option<String>, FormatError>,
-  is_mdx: bool,
-) -> dprint_core::formatting::TracingResult {
-  let (mut source_file, markdown_text) = match parse_source_file(file_text, config, is_mdx).unwrap() {
+  let (mut source_file, markdown_text) = match parse_source_file(file_text, config).unwrap() {
     ParseFileResult::IgnoreFile => panic!("Cannot trace file because it has an ignore file comment."),
     ParseFileResult::SourceFile(file) => file,
   };
@@ -192,17 +149,13 @@ enum ParseFileResult<'a> {
   SourceFile((crate::generation::common::SourceFile<'a>, &'a str)),
 }
 
-fn parse_source_file<'a>(file_text: &'a str, config: &Configuration, is_mdx: bool) -> Result<ParseFileResult<'a>, FormatError> {
+fn parse_source_file<'a>(file_text: &'a str, config: &Configuration) -> Result<ParseFileResult<'a>, FormatError> {
   // check for the presence of a dprint-ignore-file comment before parsing
   if is_ignore_comment(strip_metadata_header(file_text), &config.ignore_file_directive) {
     return Ok(ParseFileResult::IgnoreFile);
   }
 
-  let file = if is_mdx {
-    crate::parser::parse_mdx(file_text).map_err(|err| FormatError::Parse(err.to_string()))?
-  } else {
-    crate::parser::parse(file_text).map_err(|err| FormatError::Parse(err.to_string()))?
-  };
+  let file = crate::parser::parse(file_text).map_err(|err| FormatError::Parse(err.to_string()))?;
   Ok(ParseFileResult::SourceFile((file, file_text)))
 }
 

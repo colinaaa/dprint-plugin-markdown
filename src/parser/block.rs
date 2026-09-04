@@ -36,9 +36,6 @@ pub struct BlockParser<'a, 'c> {
   /// Whether a container was written deeper than [`MAX_NESTING`], which leaves
   /// what was read of the document incomplete.
   pub too_deep: std::cell::Cell<bool>,
-  /// Whether the file is MDX, which enables import/export statements and
-  /// `{expression}` blocks.
-  pub is_mdx: bool,
 }
 
 impl<'a, 'c> BlockParser<'a, 'c> {
@@ -89,11 +86,6 @@ impl<'a, 'c> BlockParser<'a, 'c> {
       Some(b'>') => self.parse_block_quote(lines, index, nodes),
       Some(b'#') if atx_heading_level(rest).is_some() => self.parse_atx_heading(lines, index, nodes),
       Some(b'`') | Some(b'~') if code_fence(rest).is_some() => self.parse_fenced_code(lines, index, nodes),
-      // MDX: JSX component blocks must be checked before HTML blocks because
-      // a capitalized tag like `<Note>` also matches CommonMark's HTML block
-      // type 7 (a complete single tag), and in MDX mode we want to preserve
-      // JSX blocks as-is rather than running them through the HTML formatter.
-      Some(b'<') if self.is_mdx && is_mdx_jsx_block(rest) => self.parse_mdx_jsx_block(lines, index, nodes),
       Some(b'<') if html_block_kind(rest, false).is_some() => self.parse_html_block(lines, index, nodes),
       Some(b'[') if footnote_definition_name(rest).is_some() => self.parse_footnote_definition(lines, index, nodes),
       Some(_) if is_thematic_break(rest) => {
@@ -106,11 +98,6 @@ impl<'a, 'c> BlockParser<'a, 'c> {
         index + 1
       }
       Some(_) if list_marker(rest).is_some() => self.parse_list(lines, index, nodes),
-      // MDX: import/export statements at the block level
-      Some(b'i') if self.is_mdx && is_mdx_import_export(rest) => self.parse_mdx_import_export(lines, index, nodes),
-      Some(b'e') if self.is_mdx && is_mdx_import_export(rest) => self.parse_mdx_import_export(lines, index, nodes),
-      // MDX: expression blocks `{...}`
-      Some(b'{') if self.is_mdx => self.parse_mdx_expression(lines, index, nodes),
       _ => self.parse_paragraph(lines, index, nodes),
     }
   }
@@ -892,93 +879,6 @@ impl<'a, 'c> BlockParser<'a, 'c> {
       _ => self.interrupts_paragraph(lines, index),
     }
   }
-
-  // ==== MDX blocks ====
-
-  /// Parses an MDX import or export statement, gathering continuation lines
-  /// until the statement is complete (balanced braces/quotes).
-  fn parse_mdx_import_export(&self, lines: &[ContentLine<'a>], index: usize, nodes: &mut Vec<Node<'a>>) -> usize {
-    let mut end = index + 1;
-    // gather lines until we have balanced braces (for `export const x = {...}`)
-    let mut brace_depth: i32 = count_brace_delta(lines[index].rest());
-    while end < lines.len() && brace_depth > 0 {
-      brace_depth += count_brace_delta(lines[end].rest());
-      end += 1;
-    }
-    // also stop at a blank line
-    while end < lines.len() && !lines[end].is_blank() && is_mdx_import_export_continuation(lines[end].rest()) {
-      end += 1;
-    }
-
-    let content: Vec<ContentLine<'a>> = lines[index..end].iter().map(|line| line.trim_end()).collect();
-    nodes.push(
-      MdxImportExport {
-        span: Span::new(lines[index].start, content.last().unwrap().end()),
-        text: join_lines(&content, self.source, false),
-      }
-      .into(),
-    );
-    end
-  }
-
-  /// Parses an MDX expression block `{...}` that spans one or more lines.
-  fn parse_mdx_expression(&self, lines: &[ContentLine<'a>], index: usize, nodes: &mut Vec<Node<'a>>) -> usize {
-    let mut end = index + 1;
-    let mut brace_depth: i32 = count_brace_delta(lines[index].rest());
-    // gather lines until braces are balanced
-    while end < lines.len() && brace_depth > 0 {
-      brace_depth += count_brace_delta(lines[end].rest());
-      end += 1;
-    }
-
-    let content: Vec<ContentLine<'a>> = lines[index..end].iter().map(|line| line.trim_end()).collect();
-    nodes.push(
-      MdxExpression {
-        span: Span::new(lines[index].start, content.last().unwrap().end()),
-        text: join_lines(&content, self.source, false),
-      }
-      .into(),
-    );
-    end
-  }
-
-  /// Parses an MDX JSX block (a JSX component at the block level that isn't
-  /// recognized as an HTML block by CommonMark rules, typically because it
-  /// starts with a capital letter).
-  fn parse_mdx_jsx_block(&self, lines: &[ContentLine<'a>], index: usize, nodes: &mut Vec<Node<'a>>) -> usize {
-    let rest = lines[index].rest();
-    let is_self_closing = rest.contains("/>");
-
-    let mut end = index + 1;
-    if !is_self_closing {
-      // gather lines until we find the matching close tag or a blank line
-      let tag_name = mdx_jsx_tag_name(rest);
-      let close_tag = format!("</{}", tag_name);
-      while end < lines.len() {
-        let line_rest = lines[end].rest();
-        if line_rest.is_empty() {
-          break;
-        }
-        if line_rest.trim_start().starts_with(&close_tag) {
-          end += 1;
-          break;
-        }
-        end += 1;
-      }
-    }
-
-    let content: Vec<ContentLine<'a>> = lines[index..end].iter().map(|line| line.trim_end()).collect();
-    // JSX blocks are preserved as-is (not formatted by the HTML formatter),
-    // so we use MdxExpression which gen_range writes verbatim
-    nodes.push(
-      MdxExpression {
-        span: Span::new(lines[index].start, content.last().unwrap().end()),
-        text: join_lines(&content, self.source, false),
-      }
-      .into(),
-    );
-    end
-  }
 }
 
 /// Whether the text would begin a block if it were at the start of a line
@@ -1619,99 +1519,6 @@ const HTML_BLOCK_TAGS: [&str; 62] = [
   "track",
   "ul",
 ];
-
-// ==== MDX recognition ====
-
-/// Whether the text starts an MDX import or export statement.
-fn is_mdx_import_export(text: &str) -> bool {
-  let text = text.trim_start();
-  // import ... or export ...
-  if text.starts_with("import ") || text.starts_with("import\t") {
-    return true;
-  }
-  if text.starts_with("export ") || text.starts_with("export\t") {
-    return true;
-  }
-  // `export default`
-  if text.starts_with("export\n") {
-    return true;
-  }
-  false
-}
-
-/// Whether a line continues an MDX import/export statement (is not a new block start).
-fn is_mdx_import_export_continuation(text: &str) -> bool {
-  let trimmed = text.trim_start();
-  // blank lines and new block starts end the import/export
-  if trimmed.is_empty() {
-    return false;
-  }
-  // if it starts with a new import/export, it's a separate statement
-  if is_mdx_import_export(trimmed) {
-    return false;
-  }
-  // any other non-empty line is a continuation (e.g. multi-line import)
-  true
-}
-
-/// Whether the text starts an MDX JSX block (a capitalized component tag or a
-/// fragment `<>` that isn't recognized by CommonMark's HTML block rules).
-fn is_mdx_jsx_block(text: &str) -> bool {
-  let rest = text.strip_prefix('<').unwrap_or("");
-  // JSX fragment: `<>`
-  if rest.starts_with('>') {
-    return true;
-  }
-  // closing fragment: `</>`
-  if rest.starts_with("/>") {
-    return true;
-  }
-  // closing tag with capital letter: `</Component>`
-  if let Some(after_slash) = rest.strip_prefix('/') {
-    return after_slash.starts_with(|c: char| c.is_ascii_uppercase());
-  }
-  // capitalized tag name: `<Component ...>`
-  rest.starts_with(|c: char| c.is_ascii_uppercase())
-}
-
-/// Extracts the tag name from the start of an MDX JSX block.
-fn mdx_jsx_tag_name(text: &str) -> &str {
-  let rest = &text[1..]; // skip '<'
-  let end = rest
-    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '.')
-    .unwrap_or(rest.len());
-  &rest[..end]
-}
-
-/// Counts the net brace depth change in a line (opening minus closing),
-/// ignoring braces inside string literals.
-fn count_brace_delta(text: &str) -> i32 {
-  let mut depth: i32 = 0;
-  let mut in_single_quote = false;
-  let mut in_double_quote = false;
-  let mut in_template = false;
-  let mut is_escaped = false;
-
-  for c in text.chars() {
-    if is_escaped {
-      is_escaped = false;
-      continue;
-    }
-    if c == '\\' {
-      is_escaped = true;
-      continue;
-    }
-    match c {
-      '\'' if !in_double_quote && !in_template => in_single_quote = !in_single_quote,
-      '"' if !in_single_quote && !in_template => in_double_quote = !in_double_quote,
-      '`' if !in_single_quote && !in_double_quote => in_template = !in_template,
-      '{' if !in_single_quote && !in_double_quote && !in_template => depth += 1,
-      '}' if !in_single_quote && !in_double_quote && !in_template => depth -= 1,
-      _ => {}
-    }
-  }
-  depth
-}
 
 // ==== tables ====
 
